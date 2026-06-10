@@ -72,7 +72,7 @@ struct ContentView: View {
             } label: {
                 Label("Process", systemImage: "wand.and.rays")
             }
-            .disabled(viewModel.selectedVideoURL == nil || viewModel.isProcessing)
+            .disabled(viewModel.selectedVideoURL == nil || viewModel.isProcessing || viewModel.isExporting)
 
             Menu {
                 Button {

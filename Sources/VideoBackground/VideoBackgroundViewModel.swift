@@ -42,7 +42,7 @@ final class VideoBackgroundViewModel: ObservableObject {
     }
 
     var showProgress: Bool {
-        isProcessing || progress > 0
+        isProcessing || isExporting || progress > 0
     }
 
     var canExport: Bool {
@@ -139,7 +139,7 @@ final class VideoBackgroundViewModel: ObservableObject {
     }
 
     func exportMovie(codec: MovieExportCodec) {
-        guard let outputVideoURL, canExport else {
+        guard let outputVideoURL, let selectedVideoURL, canExport else {
             return
         }
 
@@ -150,20 +150,33 @@ final class VideoBackgroundViewModel: ObservableObject {
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = defaultMovieExportName(for: codec)
 
+        let mp3Checkbox = NSButton(
+            checkboxWithTitle: "Also export original audio as MP3",
+            target: nil,
+            action: nil
+        )
+        mp3Checkbox.state = .off
+        mp3Checkbox.sizeToFit()
+        panel.accessoryView = mp3Checkbox
+
         guard panel.runModal() == .OK, let destinationURL = panel.url else {
             return
         }
+
+        let exportOriginalAudioMP3 = mp3Checkbox.state == .on
 
         isExporting = true
         progress = 0
         statusText = "Exporting \(codec.displayName)"
 
-        Task { [weak self, outputVideoURL, destinationURL, codec] in
+        Task { [weak self, outputVideoURL, selectedVideoURL, destinationURL, codec, exportOriginalAudioMP3] in
             do {
-                try await MovieExporter.exportMovie(
+                let result = try await MovieExporter.exportMovie(
                     from: outputVideoURL,
+                    originalAudioURL: selectedVideoURL,
                     to: destinationURL,
-                    codec: codec
+                    codec: codec,
+                    exportOriginalAudioMP3: exportOriginalAudioMP3
                 ) { [weak self] update in
                     await self?.apply(update)
                 }
@@ -171,7 +184,7 @@ final class VideoBackgroundViewModel: ObservableObject {
                 await MainActor.run {
                     self?.isExporting = false
                     self?.progress = 1
-                    self?.statusText = "Exported \(codec.displayName)"
+                    self?.statusText = self?.movieExportStatus(codec: codec, result: result) ?? "Exported \(codec.displayName)"
                 }
             } catch {
                 await MainActor.run {
@@ -239,6 +252,20 @@ final class VideoBackgroundViewModel: ObservableObject {
             .lastPathComponent ?? "background-removed"
 
         return "\(sourceName)-\(codec.fileNameSuffix).mov"
+    }
+
+    private func movieExportStatus(codec: MovieExportCodec, result: MovieExportResult) -> String {
+        var parts = ["Exported \(codec.displayName)"]
+
+        if result.audioMuxed {
+            parts.append("with original audio")
+        }
+
+        if result.mp3URL != nil {
+            parts.append("and MP3")
+        }
+
+        return parts.joined(separator: " ")
     }
 }
 
