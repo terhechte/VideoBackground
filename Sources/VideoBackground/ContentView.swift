@@ -43,6 +43,25 @@ struct ContentView: View {
                 Text(viewModel.errorMessage ?? "")
             }
         )
+        .alert(
+            "Replicate connection lost",
+            isPresented: Binding(
+                get: { viewModel.replicateRetryRequest != nil },
+                set: { if !$0 { viewModel.resolveReplicateRetry(with: .cancel) } }
+            ),
+            actions: {
+                Button("Cancel", role: .cancel) {
+                    viewModel.resolveReplicateRetry(with: .cancel)
+                }
+
+                Button("Retry") {
+                    viewModel.resolveReplicateRetry(with: .retry)
+                }
+            },
+            message: {
+                Text(viewModel.replicateRetryRequest?.message ?? "")
+            }
+        )
     }
 
     private var topBar: some View {

@@ -21,6 +21,18 @@ struct VideoProcessingResult: Sendable {
     let durationSeconds: Double
 }
 
+struct ReplicateRetryRequest: Identifiable, Sendable {
+    let id = UUID()
+    let frameIndex: Int
+    let attempt: Int
+    let message: String
+}
+
+enum ReplicateRetryDecision: Sendable, Equatable {
+    case retry
+    case cancel
+}
+
 actor VideoBackgroundProcessor {
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private lazy var imageContext = CIContext(options: [.workingColorSpace: colorSpace])
@@ -30,6 +42,7 @@ actor VideoBackgroundProcessor {
         videoURL: URL,
         timeSelection: VideoTimeSelection,
         upscaleWithReplicate: Bool = false,
+        replicateRetryDecision: (@Sendable (ReplicateRetryRequest) async -> ReplicateRetryDecision)? = nil,
         progress: @Sendable @escaping (VideoProcessingProgress) async -> Void
     ) async throws -> VideoProcessingResult {
         let fileManager = FileManager.default
@@ -40,6 +53,7 @@ actor VideoBackgroundProcessor {
 
         try fileManager.createDirectory(at: framesDirectory, withIntermediateDirectories: true)
 
+        let retryCoordinator = replicateRetryDecision.map { ReplicateRetryCoordinator(requestDecision: $0) }
         let upscaler: ReplicateImageUpscaler?
 
         if upscaleWithReplicate {
@@ -52,8 +66,12 @@ actor VideoBackgroundProcessor {
                 )
             )
 
-            upscaler = try ReplicateImageUpscaler()
-            try await upscaler?.prepare()
+            let replicateUpscaler = try ReplicateImageUpscaler()
+            try await Self.prepareReplicateUpscalerWithRetry(
+                replicateUpscaler,
+                retryCoordinator: retryCoordinator
+            )
+            upscaler = replicateUpscaler
         } else {
             upscaler = nil
         }
@@ -112,6 +130,7 @@ actor VideoBackgroundProcessor {
                 outputVideoURL: outputVideoURL,
                 rmbg: rmbg,
                 upscaler: upscaler,
+                retryCoordinator: retryCoordinator,
                 progress: progress
             )
         }
@@ -295,6 +314,7 @@ actor VideoBackgroundProcessor {
         outputVideoURL: URL,
         rmbg: RMBG2,
         upscaler: ReplicateImageUpscaler,
+        retryCoordinator: ReplicateRetryCoordinator?,
         progress: @Sendable @escaping (VideoProcessingProgress) async -> Void
     ) async throws -> VideoProcessingResult {
         await progress(
@@ -408,6 +428,7 @@ actor VideoBackgroundProcessor {
                 maxConcurrentFrames: maxConcurrentReplicateFrames,
                 rmbg: rmbg,
                 upscaler: upscaler,
+                retryCoordinator: retryCoordinator,
                 writer: writer
             )
 
@@ -441,6 +462,7 @@ actor VideoBackgroundProcessor {
         maxConcurrentFrames: Int,
         rmbg: RMBG2,
         upscaler: ReplicateImageUpscaler,
+        retryCoordinator: ReplicateRetryCoordinator?,
         writer: ProcessedVideoFrameWriter
     ) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -455,9 +477,10 @@ actor VideoBackgroundProcessor {
                 group.addTask {
                     try Task.checkCancellation()
 
-                    let upscaledFrame = try await upscaler.upscaleFrame(
-                        at: sourceFrame.imageURL,
-                        index: sourceFrame.index
+                    let upscaledFrame = try await upscaleFrameWithRetry(
+                        sourceFrame,
+                        upscaler: upscaler,
+                        retryCoordinator: retryCoordinator
                     )
                     let upscaledImage = try Self.makeCGImage(from: upscaledFrame.pngData)
                     let result = try await rmbg.removeBackground(from: upscaledImage)
@@ -480,10 +503,143 @@ actor VideoBackgroundProcessor {
                 try await group.next()
                 inFlightFrames -= 1
 
+                if let decision = await retryCoordinator?.waitForActiveDecision(),
+                   decision == .cancel {
+                    throw CancellationError()
+                }
+
                 if nextFrameIndex < sourceFrames.count {
                     enqueueNextFrame()
                 }
             }
+        }
+    }
+
+    private static func prepareReplicateUpscalerWithRetry(
+        _ upscaler: ReplicateImageUpscaler,
+        retryCoordinator: ReplicateRetryCoordinator?
+    ) async throws {
+        var attempt = 1
+
+        while true {
+            try Task.checkCancellation()
+
+            do {
+                try await upscaler.prepare()
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard let retryCoordinator, isRetryableReplicateError(error) else {
+                    throw error
+                }
+
+                let decision = await retryCoordinator.decision(
+                    for: ReplicateRetryRequest(
+                        frameIndex: 0,
+                        attempt: attempt,
+                        message: "Replicate could not be reached while preparing the upscaler.\n\n\(error.localizedDescription)\n\nRetry will continue setup. Attempt \(attempt.formatted())."
+                    )
+                )
+
+                switch decision {
+                case .retry:
+                    attempt += 1
+                    continue
+                case .cancel:
+                    throw CancellationError()
+                }
+            }
+        }
+    }
+
+    private static func upscaleFrameWithRetry(
+        _ sourceFrame: SourceVideoFrame,
+        upscaler: ReplicateImageUpscaler,
+        retryCoordinator: ReplicateRetryCoordinator?
+    ) async throws -> ReplicateImageUpscaler.UpscaledFrame {
+        var attempt = 1
+
+        while true {
+            try Task.checkCancellation()
+
+            do {
+                return try await upscaler.upscaleFrame(
+                    at: sourceFrame.imageURL,
+                    index: sourceFrame.index
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard let retryCoordinator, isRetryableReplicateError(error) else {
+                    throw error
+                }
+
+                let decision = await retryCoordinator.decision(
+                    for: ReplicateRetryRequest(
+                        frameIndex: sourceFrame.index,
+                        attempt: attempt,
+                        message: retryMessage(
+                            frameIndex: sourceFrame.index,
+                            attempt: attempt,
+                            error: error
+                        )
+                    )
+                )
+
+                switch decision {
+                case .retry:
+                    attempt += 1
+                    continue
+                case .cancel:
+                    throw CancellationError()
+                }
+            }
+        }
+    }
+
+    private static func retryMessage(frameIndex: Int, attempt: Int, error: Error) -> String {
+        "Frame \((frameIndex + 1).formatted()) could not be upscaled because the Replicate request lost its network connection.\n\n\(error.localizedDescription)\n\nRetry will continue from this frame. Attempt \(attempt.formatted())."
+    }
+
+    private static func isRetryableReplicateError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return isRetryableURLCode(urlError.code)
+        }
+
+        let nsError = error as NSError
+
+        if nsError.domain == NSURLErrorDomain {
+            return isRetryableURLCode(URLError.Code(rawValue: nsError.code))
+        }
+
+        if let replicateError = error as? ReplicateImageUpscalerError {
+            switch replicateError {
+            case .requestFailed(let statusCode, _):
+                return [408, 429, 500, 502, 503, 504].contains(statusCode)
+            default:
+                return false
+            }
+        }
+
+        return false
+    }
+
+    private static func isRetryableURLCode(_ code: URLError.Code) -> Bool {
+        switch code {
+        case .networkConnectionLost,
+             .notConnectedToInternet,
+             .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .secureConnectionFailed,
+             .dataNotAllowed,
+             .internationalRoamingOff,
+             .resourceUnavailable:
+            return true
+        default:
+            return false
         }
     }
 
@@ -642,6 +798,39 @@ private struct VideoWriterContext {
     let pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor
     let width: Int
     let height: Int
+}
+
+private actor ReplicateRetryCoordinator {
+    private let requestDecision: @Sendable (ReplicateRetryRequest) async -> ReplicateRetryDecision
+    private var activeDecisionTask: Task<ReplicateRetryDecision, Never>?
+
+    init(requestDecision: @Sendable @escaping (ReplicateRetryRequest) async -> ReplicateRetryDecision) {
+        self.requestDecision = requestDecision
+    }
+
+    func decision(for request: ReplicateRetryRequest) async -> ReplicateRetryDecision {
+        if let activeDecisionTask {
+            return await activeDecisionTask.value
+        }
+
+        let task = Task {
+            await requestDecision(request)
+        }
+        activeDecisionTask = task
+
+        let decision = await task.value
+        activeDecisionTask = nil
+
+        return decision
+    }
+
+    func waitForActiveDecision() async -> ReplicateRetryDecision? {
+        guard let activeDecisionTask else {
+            return nil
+        }
+
+        return await activeDecisionTask.value
+    }
 }
 
 private actor ProcessedVideoFrameWriter {

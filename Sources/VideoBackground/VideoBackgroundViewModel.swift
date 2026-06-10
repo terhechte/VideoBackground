@@ -14,6 +14,7 @@ final class VideoBackgroundViewModel: ObservableObject {
     @Published var isExporting = false
     @Published var errorMessage: String?
     @Published var upscaleWithReplicate = false
+    @Published var replicateRetryRequest: ReplicateRetryRequest?
     @Published var sourceDurationSeconds = 0.0
     @Published var trimStartSeconds = 0.0
     @Published var trimEndSeconds = 0.0
@@ -25,6 +26,7 @@ final class VideoBackgroundViewModel: ObservableObject {
 
     private var processingTask: Task<Void, Never>?
     private var metadataTask: Task<Void, Never>?
+    private var replicateRetryContinuation: CheckedContinuation<ReplicateRetryDecision, Never>?
     private let minimumTrimDuration = 0.1
 
     var sourceTitle: String {
@@ -130,7 +132,10 @@ final class VideoBackgroundViewModel: ObservableObject {
                 let result = try await processor.process(
                     videoURL: selectedVideoURL,
                     timeSelection: timeSelection,
-                    upscaleWithReplicate: upscaleWithReplicate
+                    upscaleWithReplicate: upscaleWithReplicate,
+                    replicateRetryDecision: { [weak self] request in
+                        await self?.requestReplicateRetry(request) ?? .cancel
+                    }
                 ) { [weak self] update in
                     await self?.apply(update)
                 }
@@ -146,6 +151,23 @@ final class VideoBackgroundViewModel: ObservableObject {
 
     func cancelProcessing() {
         processingTask?.cancel()
+        resolveReplicateRetry(with: .cancel)
+    }
+
+    func resolveReplicateRetry(with decision: ReplicateRetryDecision) {
+        guard let continuation = replicateRetryContinuation else {
+            replicateRetryRequest = nil
+            return
+        }
+
+        replicateRetryContinuation = nil
+        replicateRetryRequest = nil
+
+        if decision == .retry {
+            statusText = "Retrying Replicate upscaling"
+        }
+
+        continuation.resume(returning: decision)
     }
 
     func setTrimStart(_ seconds: Double) {
@@ -371,12 +393,24 @@ final class VideoBackgroundViewModel: ObservableObject {
         statusText = update.message
     }
 
+    private func requestReplicateRetry(_ request: ReplicateRetryRequest) async -> ReplicateRetryDecision {
+        statusText = "Replicate upscaling paused"
+
+        return await withCheckedContinuation { continuation in
+            replicateRetryContinuation?.resume(returning: .cancel)
+            replicateRetryContinuation = continuation
+            replicateRetryRequest = request
+        }
+    }
+
     private func markCancelled() {
+        resolveReplicateRetry(with: .cancel)
         isProcessing = false
         statusText = "Cancelled"
     }
 
     private func markFailed(_ error: Error) {
+        resolveReplicateRetry(with: .cancel)
         isProcessing = false
         statusText = "Failed"
         errorMessage = error.localizedDescription
