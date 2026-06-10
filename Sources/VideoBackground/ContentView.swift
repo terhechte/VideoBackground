@@ -119,6 +119,10 @@ struct ContentView: View {
                     .opacity(viewModel.showProgress ? 1 : 0.35)
             }
 
+            Toggle("Upscale frames with Replicate", isOn: $viewModel.upscaleWithReplicate)
+                .toggleStyle(.checkbox)
+                .disabled(!viewModel.canChangeProcessingOptions)
+
             if viewModel.selectedVideoURL != nil {
                 Divider()
 

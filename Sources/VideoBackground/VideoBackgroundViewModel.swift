@@ -13,6 +13,7 @@ final class VideoBackgroundViewModel: ObservableObject {
     @Published var isProcessing = false
     @Published var isExporting = false
     @Published var errorMessage: String?
+    @Published var upscaleWithReplicate = false
     @Published var sourceDurationSeconds = 0.0
     @Published var trimStartSeconds = 0.0
     @Published var trimEndSeconds = 0.0
@@ -74,6 +75,10 @@ final class VideoBackgroundViewModel: ObservableObject {
         selectedVideoURL != nil && sourceDurationSeconds > minimumTrimDuration && !isProcessing && !isExporting
     }
 
+    var canChangeProcessingOptions: Bool {
+        !isProcessing && !isExporting
+    }
+
     var previewLoopStartSeconds: Double {
         outputVideoURL == nil ? trimStartSeconds : 0
     }
@@ -116,14 +121,16 @@ final class VideoBackgroundViewModel: ObservableObject {
         isProcessing = true
         statusText = "Preparing video"
         let timeSelection = selectedTimeSelection()
+        let upscaleWithReplicate = upscaleWithReplicate
 
-        processingTask = Task { [weak self, selectedVideoURL, timeSelection] in
+        processingTask = Task { [weak self, selectedVideoURL, timeSelection, upscaleWithReplicate] in
             let processor = VideoBackgroundProcessor()
 
             do {
                 let result = try await processor.process(
                     videoURL: selectedVideoURL,
-                    timeSelection: timeSelection
+                    timeSelection: timeSelection,
+                    upscaleWithReplicate: upscaleWithReplicate
                 ) { [weak self] update in
                     await self?.apply(update)
                 }
