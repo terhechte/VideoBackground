@@ -13,6 +13,9 @@ final class VideoBackgroundViewModel: ObservableObject {
     @Published var isProcessing = false
     @Published var isExporting = false
     @Published var errorMessage: String?
+    @Published var sourceDurationSeconds = 0.0
+    @Published var trimStartSeconds = 0.0
+    @Published var trimEndSeconds = 0.0
     @Published private(set) var frameCount = 0
     @Published private(set) var outputFramesDirectory: URL?
     @Published private(set) var outputWidth = 0
@@ -20,6 +23,8 @@ final class VideoBackgroundViewModel: ObservableObject {
     @Published private(set) var durationSeconds = 0.0
 
     private var processingTask: Task<Void, Never>?
+    private var metadataTask: Task<Void, Never>?
+    private let minimumTrimDuration = 0.1
 
     var sourceTitle: String {
         selectedVideoURL?.lastPathComponent ?? "No video selected"
@@ -41,6 +46,42 @@ final class VideoBackgroundViewModel: ObservableObject {
         durationSeconds == 0 ? "-" : DurationFormatter.string(from: durationSeconds)
     }
 
+    var sourceDurationText: String {
+        sourceDurationSeconds == 0 ? "-" : DurationFormatter.string(from: sourceDurationSeconds)
+    }
+
+    var trimStartText: String {
+        DurationFormatter.string(from: trimStartSeconds)
+    }
+
+    var trimEndText: String {
+        DurationFormatter.string(from: trimEndSeconds)
+    }
+
+    var selectedDurationSeconds: Double {
+        max(trimEndSeconds - trimStartSeconds, 0)
+    }
+
+    var selectedDurationText: String {
+        DurationFormatter.string(from: selectedDurationSeconds)
+    }
+
+    var canTrim: Bool {
+        sourceDurationSeconds > minimumTrimDuration && !isProcessing && !isExporting
+    }
+
+    var canProcess: Bool {
+        selectedVideoURL != nil && sourceDurationSeconds > minimumTrimDuration && !isProcessing && !isExporting
+    }
+
+    var previewLoopStartSeconds: Double {
+        outputVideoURL == nil ? trimStartSeconds : 0
+    }
+
+    var previewLoopEndSeconds: Double {
+        outputVideoURL == nil ? trimEndSeconds : max(durationSeconds, 0)
+    }
+
     var showProgress: Bool {
         isProcessing || isExporting || progress > 0
     }
@@ -57,7 +98,7 @@ final class VideoBackgroundViewModel: ObservableObject {
             }
 
             selectedVideoURL = url
-            resetOutputState()
+            loadSourceVideo(url)
             statusText = "Loaded \(url.lastPathComponent)"
 
         case .failure(let error):
@@ -71,15 +112,19 @@ final class VideoBackgroundViewModel: ObservableObject {
         }
 
         processingTask?.cancel()
-        resetOutputState()
+        clearGeneratedOutput()
         isProcessing = true
         statusText = "Preparing video"
+        let timeSelection = selectedTimeSelection()
 
-        processingTask = Task { [weak self, selectedVideoURL] in
+        processingTask = Task { [weak self, selectedVideoURL, timeSelection] in
             let processor = VideoBackgroundProcessor()
 
             do {
-                let result = try await processor.process(videoURL: selectedVideoURL) { [weak self] update in
+                let result = try await processor.process(
+                    videoURL: selectedVideoURL,
+                    timeSelection: timeSelection
+                ) { [weak self] update in
                     await self?.apply(update)
                 }
 
@@ -94,6 +139,28 @@ final class VideoBackgroundViewModel: ObservableObject {
 
     func cancelProcessing() {
         processingTask?.cancel()
+    }
+
+    func setTrimStart(_ seconds: Double) {
+        guard sourceDurationSeconds > 0 else {
+            return
+        }
+
+        let maximumStart = max(0, trimEndSeconds - minimumTrimDuration)
+        trimStartSeconds = min(max(seconds, 0), maximumStart)
+        resetProcessedOutputForTrimChange()
+        seekPreview(to: trimStartSeconds)
+    }
+
+    func setTrimEnd(_ seconds: Double) {
+        guard sourceDurationSeconds > 0 else {
+            return
+        }
+
+        let minimumEnd = min(sourceDurationSeconds, trimStartSeconds + minimumTrimDuration)
+        trimEndSeconds = min(max(seconds, minimumEnd), sourceDurationSeconds)
+        resetProcessedOutputForTrimChange()
+        seekPreview(to: trimStartSeconds)
     }
 
     func exportPNGFrames() {
@@ -164,16 +231,18 @@ final class VideoBackgroundViewModel: ObservableObject {
         }
 
         let exportOriginalAudioMP3 = mp3Checkbox.state == .on
+        let timeSelection = selectedTimeSelection()
 
         isExporting = true
         progress = 0
         statusText = "Exporting \(codec.displayName)"
 
-        Task { [weak self, outputVideoURL, selectedVideoURL, destinationURL, codec, exportOriginalAudioMP3] in
+        Task { [weak self, outputVideoURL, selectedVideoURL, destinationURL, codec, exportOriginalAudioMP3, timeSelection] in
             do {
                 let result = try await MovieExporter.exportMovie(
                     from: outputVideoURL,
                     originalAudioURL: selectedVideoURL,
+                    timeSelection: timeSelection,
                     to: destinationURL,
                     codec: codec,
                     exportOriginalAudioMP3: exportOriginalAudioMP3
@@ -196,9 +265,40 @@ final class VideoBackgroundViewModel: ObservableObject {
         }
     }
 
-    private func resetOutputState() {
+    private func loadSourceVideo(_ url: URL) {
+        metadataTask?.cancel()
         player?.pause()
-        player = nil
+        player = AVPlayer(url: url)
+        sourceDurationSeconds = 0
+        trimStartSeconds = 0
+        trimEndSeconds = 0
+        clearGeneratedOutput()
+
+        metadataTask = Task { [weak self, url] in
+            do {
+                let asset = AVURLAsset(url: url)
+                let duration = try await asset.load(.duration)
+                let seconds = duration.seconds.isFinite ? max(duration.seconds, 0) : 0
+
+                await MainActor.run {
+                    guard self?.selectedVideoURL == url else {
+                        return
+                    }
+
+                    self?.sourceDurationSeconds = seconds
+                    self?.trimStartSeconds = 0
+                    self?.trimEndSeconds = seconds
+                    self?.seekPreview(to: 0)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func clearGeneratedOutput() {
         outputVideoURL = nil
         outputFramesDirectory = nil
         frameCount = 0
@@ -206,6 +306,35 @@ final class VideoBackgroundViewModel: ObservableObject {
         outputHeight = 0
         durationSeconds = 0
         progress = 0
+    }
+
+    private func resetProcessedOutputForTrimChange() {
+        guard outputVideoURL != nil || outputFramesDirectory != nil else {
+            return
+        }
+
+        clearGeneratedOutput()
+
+        if let selectedVideoURL {
+            player?.pause()
+            player = AVPlayer(url: selectedVideoURL)
+        }
+
+        statusText = "Trim updated"
+    }
+
+    private func seekPreview(to seconds: Double) {
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        player?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func selectedTimeSelection() -> VideoTimeSelection {
+        let duration = max(selectedDurationSeconds, minimumTrimDuration)
+
+        return VideoTimeSelection(
+            startSeconds: trimStartSeconds,
+            durationSeconds: duration
+        )
     }
 
     private func apply(_ update: VideoProcessingProgress) {

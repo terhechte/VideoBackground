@@ -27,6 +27,7 @@ actor VideoBackgroundProcessor {
 
     func process(
         videoURL: URL,
+        timeSelection: VideoTimeSelection,
         progress: @Sendable @escaping (VideoProcessingProgress) async -> Void
     ) async throws -> VideoProcessingResult {
         let fileManager = FileManager.default
@@ -66,14 +67,14 @@ actor VideoBackgroundProcessor {
             throw VideoProcessingError.noVideoTrack
         }
 
-        let duration = try await asset.load(.duration)
+        let assetDuration = try await asset.load(.duration)
         let naturalSize = try await videoTrack.load(.naturalSize)
         let preferredTransform = try await videoTrack.load(.preferredTransform)
         let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
         let width = max(1, Int(naturalSize.width.rounded()))
         let height = max(1, Int(naturalSize.height.rounded()))
         let estimatedFrameCount = estimatedFrames(
-            duration: duration,
+            duration: timeSelection.cmTimeRange.duration,
             nominalFrameRate: nominalFrameRate
         )
 
@@ -87,6 +88,8 @@ actor VideoBackgroundProcessor {
         )
 
         let reader = try AVAssetReader(asset: asset)
+        reader.timeRange = clippedTimeRange(timeSelection.cmTimeRange, assetDuration: assetDuration)
+
         let readerOutput = AVAssetReaderTrackOutput(
             track: videoTrack,
             outputSettings: [
@@ -237,7 +240,7 @@ actor VideoBackgroundProcessor {
             frameCount: frameIndex,
             width: width,
             height: height,
-            durationSeconds: duration.seconds.isFinite ? duration.seconds : 0
+            durationSeconds: timeSelection.durationSeconds
         )
     }
 
@@ -327,6 +330,22 @@ actor VideoBackgroundProcessor {
 
         let framesPerSecond = max(Double(nominalFrameRate), 1)
         return max(1, Int((duration.seconds * framesPerSecond).rounded()))
+    }
+
+    private func clippedTimeRange(_ timeRange: CMTimeRange, assetDuration: CMTime) -> CMTimeRange {
+        guard assetDuration.isNumeric else {
+            return timeRange
+        }
+
+        guard CMTimeCompare(timeRange.start, assetDuration) < 0 else {
+            return CMTimeRange(start: .zero, duration: assetDuration)
+        }
+
+        let requestedEnd = CMTimeAdd(timeRange.start, timeRange.duration)
+        let end = CMTimeMinimum(requestedEnd, assetDuration)
+        let duration = CMTimeSubtract(end, timeRange.start)
+
+        return CMTimeRange(start: timeRange.start, duration: duration)
     }
 
     private func progressFraction(completedFrames: Int, estimatedFrames: Int) -> Double {

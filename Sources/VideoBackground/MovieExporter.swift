@@ -47,6 +47,7 @@ enum MovieExporter {
     static func exportMovie(
         from processedVideoURL: URL,
         originalAudioURL: URL,
+        timeSelection: VideoTimeSelection,
         to destinationURL: URL,
         codec: MovieExportCodec,
         exportOriginalAudioMP3: Bool,
@@ -63,6 +64,7 @@ enum MovieExporter {
         }
 
         let audioTrackCount = try await audioTrackCount(in: originalAudioURL)
+        let hasSourceAudio = audioTrackCount > 0
         let videoOnlyURL: URL
 
         if codec == .proRes4444 {
@@ -79,14 +81,15 @@ enum MovieExporter {
 
         await progress(
             MovieExportProgress(
-                message: audioTrackCount > 0 ? "Adding original audio" : "Writing movie",
+                message: hasSourceAudio ? "Adding original audio" : "Writing movie",
                 fraction: 0.82
             )
         )
 
-        try await muxMovie(
+        let audioMuxed = try await muxMovie(
             videoURL: videoOnlyURL,
-            originalAudioURL: audioTrackCount > 0 ? originalAudioURL : nil,
+            originalAudioURL: hasSourceAudio ? originalAudioURL : nil,
+            audioTimeSelection: timeSelection,
             to: destinationURL,
             progress: progress
         )
@@ -94,7 +97,7 @@ enum MovieExporter {
         var mp3URL: URL?
 
         if exportOriginalAudioMP3 {
-            if audioTrackCount > 0 {
+            if audioMuxed {
                 let destinationMP3URL = destinationURL
                     .deletingPathExtension()
                     .appendingPathExtension("mp3")
@@ -106,7 +109,11 @@ enum MovieExporter {
                     )
                 )
 
-                try await exportMP3(from: originalAudioURL, to: destinationMP3URL)
+                try await exportMP3(
+                    from: originalAudioURL,
+                    timeSelection: timeSelection,
+                    to: destinationMP3URL
+                )
                 mp3URL = destinationMP3URL
             } else {
                 await progress(
@@ -125,7 +132,7 @@ enum MovieExporter {
             )
         )
 
-        return MovieExportResult(audioMuxed: audioTrackCount > 0, mp3URL: mp3URL)
+        return MovieExportResult(audioMuxed: audioMuxed, mp3URL: mp3URL)
     }
 
     private static func transcodeVideo(
@@ -287,9 +294,10 @@ enum MovieExporter {
     private static func muxMovie(
         videoURL: URL,
         originalAudioURL: URL?,
+        audioTimeSelection: VideoTimeSelection,
         to destinationURL: URL,
         progress: @Sendable @escaping (MovieExportProgress) async -> Void
-    ) async throws {
+    ) async throws -> Bool {
         let fileManager = FileManager.default
         let temporaryURL = destinationURL
             .deletingLastPathComponent()
@@ -321,25 +329,33 @@ enum MovieExporter {
         )
         compositionVideoTrack.preferredTransform = preferredTransform
 
+        var insertedAudioTrackCount = 0
+
         if let originalAudioURL {
             let audioAsset = AVURLAsset(url: originalAudioURL)
             let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
             let audioDuration = try await audioAsset.load(.duration)
-            let muxDuration = clippedDuration(videoDuration: videoDuration, audioDuration: audioDuration)
 
-            for sourceAudioTrack in audioTracks {
-                guard let compositionAudioTrack = composition.addMutableTrack(
-                    withMediaType: .audio,
-                    preferredTrackID: kCMPersistentTrackID_Invalid
-                ) else {
-                    continue
+            if let audioTimeRange = clippedAudioTimeRange(
+                selection: audioTimeSelection,
+                videoDuration: videoDuration,
+                audioDuration: audioDuration
+            ) {
+                for sourceAudioTrack in audioTracks {
+                    guard let compositionAudioTrack = composition.addMutableTrack(
+                        withMediaType: .audio,
+                        preferredTrackID: kCMPersistentTrackID_Invalid
+                    ) else {
+                        continue
+                    }
+
+                    try compositionAudioTrack.insertTimeRange(
+                        audioTimeRange,
+                        of: sourceAudioTrack,
+                        at: .zero
+                    )
+                    insertedAudioTrackCount += 1
                 }
-
-                try compositionAudioTrack.insertTimeRange(
-                    CMTimeRange(start: .zero, duration: muxDuration),
-                    of: sourceAudioTrack,
-                    at: .zero
-                )
             }
         }
 
@@ -369,9 +385,15 @@ enum MovieExporter {
         }
 
         try fileManager.moveItem(at: temporaryURL, to: destinationURL)
+
+        return insertedAudioTrackCount > 0
     }
 
-    private static func exportMP3(from sourceURL: URL, to destinationURL: URL) async throws {
+    private static func exportMP3(
+        from sourceURL: URL,
+        timeSelection: VideoTimeSelection,
+        to destinationURL: URL
+    ) async throws {
         try await Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
 
@@ -395,6 +417,8 @@ enum MovieExporter {
             process.executableURL = ffmpegURL
             process.arguments = [
                 "-y",
+                "-ss", String(format: "%.6f", timeSelection.startSeconds),
+                "-t", String(format: "%.6f", timeSelection.durationSeconds),
                 "-i", sourceURL.path,
                 "-vn",
                 "-map", "0:a:0",
@@ -442,6 +466,42 @@ enum MovieExporter {
         }
 
         return nil
+    }
+
+    private static func clippedAudioTimeRange(
+        selection: VideoTimeSelection,
+        videoDuration: CMTime,
+        audioDuration: CMTime
+    ) -> CMTimeRange? {
+        let requested = selection.cmTimeRange
+        let requestedDuration = clippedDuration(
+            videoDuration: videoDuration,
+            audioDuration: requested.duration
+        )
+
+        guard CMTimeCompare(requestedDuration, .zero) > 0 else {
+            return nil
+        }
+
+        guard audioDuration.isNumeric else {
+            return CMTimeRange(start: requested.start, duration: requestedDuration)
+        }
+
+        guard CMTimeCompare(requested.start, audioDuration) < 0 else {
+            return nil
+        }
+
+        let remainingAudioDuration = CMTimeSubtract(audioDuration, requested.start)
+        let duration = clippedDuration(
+            videoDuration: requestedDuration,
+            audioDuration: remainingAudioDuration
+        )
+
+        guard CMTimeCompare(duration, .zero) > 0 else {
+            return nil
+        }
+
+        return CMTimeRange(start: requested.start, duration: duration)
     }
 
     private static func clippedDuration(videoDuration: CMTime, audioDuration: CMTime) -> CMTime {
